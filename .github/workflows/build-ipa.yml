@@ -1,0 +1,113 @@
+name: Build IPA
+
+# Manual only: run it from the Actions tab > "Build IPA" > "Run workflow".
+# Needs a repository secret named GAME_ZIP_URL: a direct download link to a zip
+# containing b/<build>/game.wasm. The game's code is compiled and baked into the
+# app, so no JIT is needed on the device.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0). Leave empty for build-<run number>"
+        required: false
+        type: string
+      bundle_id:
+        description: "Bundle identifier (leave empty for the default)"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # needed to create the release
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+env:
+  # Must match TOOLCHAIN in make-ios.sh
+  RUST_TOOLCHAIN: "1.98.1"
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download game zip
+        env:
+          GAME_ZIP_URL: ${{ secrets.GAME_ZIP_URL }}
+        run: |
+          if [ -z "$GAME_ZIP_URL" ]; then
+            echo "::error::Add a GAME_ZIP_URL repository secret (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          echo "::add-mask::$GAME_ZIP_URL"
+          curl -fL --retry 3 --retry-delay 5 -o game.zip "$GAME_ZIP_URL"
+          unzip -t game.zip > /dev/null
+          unzip -Z1 game.zip | grep -E '(^|/)b/[^/]+/game\.wasm$' | head -1 \
+            || { echo "::error::game.zip has no b/<build>/game.wasm"; exit 1; }
+
+      - name: Show build environment
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
+
+      - name: Install build dependencies
+        run: |
+          brew install rustup xcodegen
+          echo "/opt/homebrew/opt/rustup/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN"
+          rustup target add aarch64-apple-ios --toolchain "$RUST_TOOLCHAIN"
+
+      # --ipa builds unsigned (no TEAM needed)
+      - name: Build IPA with game code
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          [ -n "$BUNDLE_ID" ] || unset BUNDLE_ID
+          ./make-ios.sh game.zip --ipa
+          rm -f game.zip
+
+      - name: Verify IPA
+        run: |
+          test -f build/Muguet.ipa
+          ls -lh build/Muguet.ipa
+          unzip -t build/Muguet.ipa > /dev/null
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-unsigned-IPA
+          path: build/Muguet.ipa
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          TAG="${TAG:-build-${GITHUB_RUN_NUMBER}}"
+          FLAGS=""
+          [ "$PRERELEASE" = "true" ] && FLAGS="$FLAGS --prerelease"
+          gh release create "$TAG" build/Muguet.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Muguet $TAG" \
+            --generate-notes \
+            --notes "Unsigned IPA with the game's code built in. Install it with AltStore, then import your game data in the app." \
+            $FLAGS
