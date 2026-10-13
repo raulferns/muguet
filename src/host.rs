@@ -123,6 +123,12 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "muguet_script" => crate::mp::script_tick(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
         "muguet_explosion" => crate::mp::explosion(int(params, 0) as u64),
         "muguet_timewarp" => set_int(results, crate::mp::time_warp(int(params, 0))),
+        "muguet_opus_frame" => {
+            let (base, len) = crate::mem_base_len(mem);
+            let heap = unsafe { std::slice::from_raw_parts_mut(base, len) };
+            let p = |i| int(params, i);
+            set_int(results, crate::opus::decode_frame(heap, p(0) as u64, p(1) as u64, p(2) as i32, p(3) as u64, p(4) as i32, p(5) as i32))
+        }
         "muguet_text" => set_int(results, missing_text(&mut caller, int(params, 0) as u32)? as i64),
         "__pthread_create_js" => {
             let r = spawn_pthread(int(params, 0) as u64, int(params, 2) as u64, int(params, 3) as u64);
@@ -146,7 +152,7 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         }
         "_abort_js" => anyhow::bail!("engine called abort()"),
         "emscripten_num_logical_cores" => set_int(results, std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(8)),
-        "emscripten_get_heap_max" => set_int(results, 17_179_869_184),
+        "emscripten_get_heap_max" => set_int(results, heap_max(mem) as i64),
         "emscripten_resize_heap" => set_int(results, resize_heap(mem, int(params, 0) as u64) as i64),
         "_emscripten_system" => set_int(results, if int(params, 0) == 0 { 0 } else { -52 }),
         "emscripten_stack_snapshot" | "emscripten_stack_unwind_buffer" => set_int(results, 0),
@@ -243,16 +249,21 @@ fn invoke(caller: &mut Caller<'_, HostState>, params: &[Val], results: &mut [Val
     }
 }
 
+// a 64-bit memory can grow to 16 GiB; a 32-bit one (ios, see mem32.rs) stops just short of 4 GiB
+fn heap_max(mem: &SharedMemory) -> u64 {
+    if mem.ty().is_64() { 17_179_869_184 } else { (1 << 32) - 65536 }
+}
+
 fn resize_heap(mem: &SharedMemory, requested: u64) -> bool {
-    const MAX: u64 = 17_179_869_184;
+    let max = heap_max(mem);
     let old = mem.data_size() as u64;
     if requested <= old { return false; }
-    if requested > MAX { return false; }
+    if requested > max { return false; }
     let mut cut = 1u64;
     while cut <= 4 {
         let over = (old as f64 * (1.0 + 0.2 / cut as f64)) as u64;
         let over = over.min(requested + 100_663_296);
-        let new = MAX.min(requested.max(over).div_ceil(65536) * 65536);
+        let new = max.min(requested.max(over).div_ceil(65536) * 65536);
         let pages = (new - old).div_ceil(65536);
         if mem.grow(pages).is_ok() {
             eprintln!("[host] heap grown to {} MB", mem.data_size() >> 20);

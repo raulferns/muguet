@@ -34,6 +34,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("DeletePed", "ped_commands::CommandDeletePed(int&)"),
     ("GetVehiclePedIsIn", "ped_commands::CommandGetVehiclePedIsIn(int, bool)"),
     ("IsPedInAnyVehicle", "ped_commands::CommandIsPedInAnyVehicle(int, bool)"),
+    ("IsPedInAnyPlane", "ped_commands::CommandIsPedInAnyPlane(int)"),
+    ("IsPedInAnyHeli", "ped_commands::CommandIsPedInAnyHeli(int)"),
     ("IsPedDeadOrDying", "ped_commands::CommandIsPedDeadOrDying(int, bool)"),
     ("IsPedShooting", "ped_commands::CommandIsPedShooting(int)"),
     ("GetPedArmour", "ped_commands::CommandGetPedArmour(int)"),
@@ -882,6 +884,31 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             let ped = c.i("PlayerPedId", &[]);
             let in_car = ped != 0 && c.exists(ped) && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0;
             crate::pad::IN_VEHICLE.store(in_car, Ordering::Relaxed);
+            let in_air = in_car && (c.i("IsPedInAnyPlane", &[i(ped)]) != 0 || c.i("IsPedInAnyHeli", &[i(ped)]) != 0);
+            crate::pad::IN_AIRCRAFT.store(in_air, Ordering::Relaxed);
+
+            // debug: MUGUET_SPAWN_VEHICLE=<model> spawns that vehicle beside the player once, 30 s in, and seats them in it
+            static SPAWN_CLOCK: OnceLock<Instant> = OnceLock::new();
+            static SPAWNED: AtomicBool = AtomicBool::new(false);
+            let ready = SPAWN_CLOCK.get_or_init(Instant::now).elapsed() > Duration::from_secs(30);
+            if ready && !in_car && !SPAWNED.load(Ordering::Relaxed) && ped != 0 && c.exists(ped) {
+                if let Ok(name) = std::env::var("MUGUET_SPAWN_VEHICLE") {
+                    let model = proto::joaat(&name.to_lowercase()) as i32;
+                    if c.i("HasModelLoaded", &[i(model)]) != 0 {
+                        let at = c_pos(&mut c, ped);
+                        let heading = c.f("GetEntityHeading", &[i(ped)]);
+                        let pos = c.vec_arg(1, [at[0] + 6.0, at[1], at[2] + 1.0]);
+                        let veh = c.i("CreateVehicle", &[i(model), pos, f(heading), b(false), b(false), b(false)]);
+                        if veh != 0 {
+                            c.i("SetPedIntoVehicle", &[i(ped), i(veh), i(-1)]);
+                            eprintln!("[mp] debug: spawned {name} and seated the player");
+                        }
+                        SPAWNED.store(true, Ordering::Relaxed);
+                    } else {
+                        c.i("RequestModel", &[i(model)]);
+                    }
+                }
+            }
 
             static HORN_AT: Mutex<Option<Instant>> = Mutex::new(None);
             let mut horn_at = HORN_AT.lock().unwrap();

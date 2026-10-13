@@ -40,6 +40,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: performance
 
       - name: Download game zip
         env:
@@ -106,7 +108,7 @@ jobs:
           [ "$PRERELEASE" = "true" ] && FLAGS="$FLAGS --prerelease"
           gh release create "$TAG" build/Muguet.ipa \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target performance \
             --title "Muguet $TAG" \
             --generate-notes \
             --notes "Unsigned IPA with the game's code built in. Install it with AltStore, then import your game data in the app." \

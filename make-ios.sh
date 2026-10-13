@@ -42,6 +42,9 @@ if [ -n "$ZIP" ]; then
   esac
   ./target/release/muguet --patch target/ios-game/game.wasm target/ios-game/game.patched.wasm
   mv target/ios-game/game.patched.wasm target/ios-game/game.wasm
+  # 32-bit memory: lets the engine drop the bounds check on every memory access
+  ./target/release/muguet --mem32 target/ios-game/game.wasm target/ios-game/game.m32.wasm
+  mv target/ios-game/game.m32.wasm target/ios-game/game.wasm
   if command -v wasm-opt >/dev/null; then
     SUM="$(shasum -a 256 target/ios-game/game.wasm | cut -c1-16)"
     if [ ! -f "target/ios-game/game.opt-$SUM.wasm" ]; then
@@ -63,7 +66,7 @@ else
   unset MUGUET_GAME_CODE || true
 fi
 
-IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo "+$TOOLCHAIN" build --release --no-default-features --target aarch64-apple-ios --target-dir target/ios
+CARGO_PROFILE_RELEASE_LTO=false IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo "+$TOOLCHAIN" build --release --no-default-features --target aarch64-apple-ios --target-dir target/ios
 
 (cd ios && xcodegen generate --quiet)
 rm -rf target/ios-xcode/Build/Products

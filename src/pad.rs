@@ -12,6 +12,8 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static FOCUSED: AtomicBool = AtomicBool::new(true);
 
 pub static IN_VEHICLE: AtomicBool = AtomicBool::new(false);
+// set alongside IN_VEHICLE when that vehicle is a plane or a helicopter
+pub static IN_AIRCRAFT: AtomicBool = AtomicBool::new(false);
 
 pub static HORN_PAD: AtomicBool = AtomicBool::new(false);
 pub static HORN_TOUCH: AtomicBool = AtomicBool::new(false);
@@ -59,15 +61,27 @@ pub fn poll() -> bool {
     st.last = Instant::now();
 
     let in_car = IN_VEHICLE.load(Ordering::Relaxed);
+    let in_air = in_car && IN_AIRCRAFT.load(Ordering::Relaxed);
     HORN_PAD.store(false, Ordering::Relaxed);
     let mut keys: HashSet<&'static str> = HashSet::new();
     let mut buttons = 0u8;
     unsafe {
         let ls = gp.leftThumbstick();
         let (lx, ly) = (ls.xAxis().value(), ls.yAxis().value());
-        if lx < -STICK_DEADZONE { keys.insert("KeyA"); }
-        if lx > STICK_DEADZONE { keys.insert("KeyD"); }
-        if in_car {
+        if in_air {
+            // console flight layout: left stick rolls and pitches, shoulders yaw, triggers throttle
+            if lx < -STICK_DEADZONE { keys.insert("Numpad4"); }
+            if lx > STICK_DEADZONE { keys.insert("Numpad6"); }
+            if ly > STICK_DEADZONE { keys.insert("Numpad8"); }
+            if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
+            if down(&gp.leftShoulder()) { keys.insert("KeyA"); }
+            if down(&gp.rightShoulder()) { keys.insert("KeyD"); }
+            if gp.leftThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyG"); }
+            if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
+            if gp.leftTrigger().value() > 0.2 { keys.insert("KeyS"); }
+        } else if in_car {
+            if lx < -STICK_DEADZONE { keys.insert("KeyA"); }
+            if lx > STICK_DEADZONE { keys.insert("KeyD"); }
             if ly > STICK_DEADZONE { keys.insert("Numpad8"); }
             if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
             if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
@@ -76,6 +90,8 @@ pub fn poll() -> bool {
             HORN_PAD.store(gp.leftThumbstickButton().is_some_and(|b| down(&b)), Ordering::Relaxed);
             if down(&gp.buttonX()) { keys.insert("Space"); }
         } else {
+            if lx < -STICK_DEADZONE { keys.insert("KeyA"); }
+            if lx > STICK_DEADZONE { keys.insert("KeyD"); }
             if ly > STICK_DEADZONE { keys.insert("KeyW"); }
             if ly < -STICK_DEADZONE { keys.insert("KeyS"); }
             if gp.rightTrigger().value() > 0.2 { buttons |= 1; }
@@ -88,7 +104,7 @@ pub fn poll() -> bool {
         if down(&gp.buttonA()) { keys.insert("Enter"); }
         if down(&gp.buttonB()) { keys.insert("KeyR"); keys.insert("Backspace"); }
         if down(&gp.buttonY()) { keys.insert("KeyF"); }
-        if down(&gp.leftShoulder()) { keys.insert("Tab"); }
+        if down(&gp.leftShoulder()) && !in_air { keys.insert("Tab"); }
         if gp.rightThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyC"); }
         let dp = gp.dpad();
         if down(&dp.up()) { keys.insert("ArrowUp"); }

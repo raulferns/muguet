@@ -28,6 +28,7 @@ enum Act {
 #[derive(Clone, Copy)]
 enum Anchor {
     BottomRight(f64, f64),
+    BottomLeft(f64, f64),
     TopLeft(f64, f64),
     TopRight(f64, f64),
 
@@ -39,14 +40,24 @@ struct Spec {
     radius: f64,
     on_foot: Option<(&'static str, Act)>,
     in_car: Option<(&'static str, Act)>,
+    // planes and helicopters: None falls back to the in-car action, Some(None) hides the button
+    in_air: Option<Option<(&'static str, Act)>>,
     nav: bool,
 }
 
 const fn b(anchor: Anchor, radius: f64, on_foot: Option<(&'static str, Act)>, in_car: Option<(&'static str, Act)>) -> Spec {
-    Spec { anchor, radius, on_foot, in_car, nav: false }
+    Spec { anchor, radius, on_foot, in_car, in_air: None, nav: false }
+}
+// a car button with no use in the air
+const fn not_air(anchor: Anchor, radius: f64, on_foot: Option<(&'static str, Act)>, in_car: Option<(&'static str, Act)>) -> Spec {
+    Spec { anchor, radius, on_foot, in_car, in_air: Some(None), nav: false }
+}
+// a button that only exists in the air
+const fn air(anchor: Anchor, radius: f64, label: &'static str, act: Act) -> Spec {
+    Spec { anchor, radius, on_foot: None, in_car: None, in_air: Some(Some((label, act))), nav: false }
 }
 const fn n(x: f64, label: &'static str, key: &'static str) -> Spec {
-    Spec { anchor: Anchor::Nav(x, 0.0), radius: 21.0, on_foot: Some((label, Act::Key(key))), in_car: Some((label, Act::Key(key))), nav: true }
+    Spec { anchor: Anchor::Nav(x, 0.0), radius: 21.0, on_foot: Some((label, Act::Key(key))), in_car: Some((label, Act::Key(key))), in_air: None, nav: true }
 }
 
 use Act::*;
@@ -54,9 +65,13 @@ use Anchor::*;
 const BUTTONS: &[Spec] = &[
     b(BottomRight(62.0, 68.0), 40.0, Some(("FIRE", Mouse(1))), Some(("GAS", Key("KeyW")))),
     b(BottomRight(158.0, 46.0), 31.0, Some(("AIM", AimToggle)), Some(("BRAKE", Key("KeyS")))),
-    b(BottomRight(58.0, 168.0), 28.0, Some(("JUMP", Key("Space"))), Some(("H.BRAKE", Key("Space")))),
+    // flying: landing gear up/down (INPUT_VEH_FLY_UNDERCARRIAGE is G)
+    Spec { anchor: BottomRight(58.0, 168.0), radius: 28.0, on_foot: Some(("JUMP", Key("Space"))), in_car: Some(("H.BRAKE", Key("Space"))), in_air: Some(Some(("GEAR", Key("KeyG")))), nav: false },
     b(BottomRight(140.0, 132.0), 26.0, Some(("ENTER", Key("KeyF"))), Some(("EXIT", Key("KeyF")))),
-    b(BottomRight(222.0, 98.0), 24.0, Some(("RELOAD", Key("KeyR"))), Some(("HORN", Horn))),
+    not_air(BottomRight(222.0, 98.0), 24.0, Some(("RELOAD", Key("KeyR"))), Some(("HORN", Horn))),
+    // rudder, as a pair above the stick so the right thumb stays on the throttle (GTA's keyboard flight layout: A/D yaw)
+    air(BottomLeft(55.0, 205.0), 28.0, "◀ YAW", Key("KeyA")),
+    air(BottomLeft(141.0, 205.0), 28.0, "YAW ▶", Key("KeyD")),
     b(TopRight(30.0, 30.0), 22.0, Some(("WEAPON", Key("Tab"))), Some(("WEAPON", Key("Tab")))),
     b(TopRight(84.0, 30.0), 22.0, Some(("COVER", Key("KeyQ"))), Some(("RADIO", Key("KeyQ")))),
     b(TopRight(138.0, 30.0), 22.0, Some(("CROUCH", Key("ControlLeft"))), Some(("LOOK\nBACK", Key("KeyC")))),
@@ -118,6 +133,7 @@ struct Overlay {
     aim_latched: bool,
     nav: bool,
     in_car: bool,
+    in_air: bool,
     hidden: bool,
 }
 
@@ -204,6 +220,9 @@ fn label(parent: &AnyObject, r: f64) -> Retained<AnyObject> {
         let _: () = msg_send![&*l, setFrame: rect(2.0, 0.0, 2.0 * r - 4.0, 2.0 * r)];
         let _: () = msg_send![&*l, setUserInteractionEnabled: false];
         let _: () = msg_send![&*l, setTextColor: &*color(1.0, 0.9)];
+        // keeps labels readable over bright scenery
+        let _: () = msg_send![&*l, setShadowColor: &*color(0.0, 0.85)];
+        let _: () = msg_send![&*l, setShadowOffset: CGSize { width: 0.0, height: 1.0 }];
         let font: Retained<AnyObject> = msg_send![class!(UIFont), boldSystemFontOfSize: (r * 0.42).clamp(9.0, 15.0)];
         let _: () = msg_send![&*l, setFont: &*font];
         let _: () = msg_send![&*l, setTextAlignment: 1isize];
@@ -249,6 +268,7 @@ pub fn install(window: &Window) {
     let (sx, sy, sw, sh) = safe;
     let place = |a: Anchor| match a {
         BottomRight(dx, dy) => (sx + sw - dx, sy + sh - dy),
+        BottomLeft(dx, dy) => (sx + dx, sy + sh - dy),
         TopLeft(dx, dy) => (sx + dx, sy + dy),
         TopRight(dx, dy) => (sx + sw - dx, sy + dy),
         Nav(dx, dy) => (sx + sw / 2.0 + dx, sy + 30.0 + dy),
@@ -269,7 +289,7 @@ pub fn install(window: &Window) {
         root, buttons, stick_base, stick_knob, stick_home, safe, scale,
         grips: HashMap::new(), held: HashSet::new(), since: HashMap::new(),
         mouse_since: [std::time::Instant::now(); 2], lingering: false, mouse: 0, aim_latched: false,
-        nav: false, in_car: false, hidden: false,
+        nav: false, in_car: false, in_air: false, hidden: false,
     };
     o.relabel();
     eprintln!("[touch] overlay ready ({:.0}x{:.0} pt, safe area {:.0},{:.0} {:.0}x{:.0})", full.width, full.height, sx, sy, sw, sh);
@@ -288,7 +308,7 @@ impl Overlay {
     fn spec_act(&self, idx: usize) -> Option<(&'static str, Act)> {
         let s = &BUTTONS[idx];
         if s.nav && !self.nav { return None; }
-        if self.in_car { s.in_car } else { s.on_foot }
+        if self.in_air { s.in_air.unwrap_or(s.in_car) } else if self.in_car { s.in_car } else { s.on_foot }
     }
 
     fn relabel(&mut self) {
@@ -386,14 +406,22 @@ impl Overlay {
             dx *= k;
             dy *= k;
             let (nx, ny) = (dx / STICK_RADIUS, dy / STICK_RADIUS);
-            if nx < -0.35 { keys.insert("KeyA"); }
-            if nx > 0.35 { keys.insert("KeyD"); }
-            if self.in_car {
-                if ny < -0.6 { keys.insert("Numpad8"); }
-                if ny > 0.6 { keys.insert("Numpad2"); }
+            if self.in_air {
+                // flight stick: sideways banks, up pushes the nose down
+                if nx < -0.35 { keys.insert("Numpad4"); }
+                if nx > 0.35 { keys.insert("Numpad6"); }
+                if ny < -0.35 { keys.insert("Numpad8"); }
+                if ny > 0.35 { keys.insert("Numpad2"); }
             } else {
-                if ny < -0.35 { keys.insert("KeyW"); }
-                if ny > 0.35 { keys.insert("KeyS"); }
+                if nx < -0.35 { keys.insert("KeyA"); }
+                if nx > 0.35 { keys.insert("KeyD"); }
+                if self.in_car {
+                    if ny < -0.6 { keys.insert("Numpad8"); }
+                    if ny > 0.6 { keys.insert("Numpad2"); }
+                } else {
+                    if ny < -0.35 { keys.insert("KeyW"); }
+                    if ny > 0.35 { keys.insert("KeyS"); }
+                }
             }
             let sprint = !self.in_car && len > STICK_RADIUS * SPRINT_REACH;
             if sprint { keys.insert("ShiftLeft"); }
@@ -481,9 +509,11 @@ pub fn refresh() -> bool {
             set_hidden(&o.root, hide);
         }
         let in_car = crate::pad::IN_VEHICLE.load(std::sync::atomic::Ordering::Relaxed);
-        if in_car != o.in_car && !o.hidden {
+        let in_air = in_car && crate::pad::IN_AIRCRAFT.load(std::sync::atomic::Ordering::Relaxed);
+        if (in_car != o.in_car || in_air != o.in_air) && !o.hidden {
             o.grips.retain(|_, g| !matches!(g, Grip::Button { .. }));
             o.in_car = in_car;
+            o.in_air = in_air;
             if in_car { o.aim_latched = false; }
             o.apply();
             o.relabel();

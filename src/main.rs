@@ -6,6 +6,7 @@ mod audio;
 mod config;
 mod fs;
 mod gpu;
+mod heapcheck;
 mod host;
 mod input;
 mod import;
@@ -13,7 +14,10 @@ mod io;
 #[cfg(target_os = "ios")]
 mod keyboard;
 mod mp;
+mod opus;
 mod pad;
+#[cfg(feature = "jit")]
+mod mem32;
 #[cfg(feature = "jit")]
 mod patch;
 mod proto;
@@ -61,6 +65,58 @@ pub fn footprint_mb() -> u64 {
     info[2 + 7] >> 20
 }
 
+pub fn heap_resident_mb() -> u64 {
+    let Some(rt) = RT.get() else { return 0 };
+    let (base, len) = mem_base_len(&rt.mem);
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+    let start = (base as usize) & !(page - 1);
+    let len = len + (base as usize - start);
+    let mut vec = vec![0 as libc::c_char; len.div_ceil(page)];
+    if unsafe { libc::mincore(start as *const libc::c_void, len, vec.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    (vec.iter().filter(|&&v| v & 1 != 0).count() * page >> 20) as u64
+}
+
+pub fn compressed_mb() -> u64 {
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+    }
+    const TASK_VM_INFO: i32 = 22;
+    let mut info = [0u64; 64];
+    let mut count = 128u32;
+    if unsafe { task_info(mach_task_self(), TASK_VM_INFO, info.as_mut_ptr(), &mut count) } != 0 {
+        return 0;
+    }
+    info[15] >> 20
+}
+
+pub fn malloc_mb() -> u64 {
+    #[repr(C)]
+    struct Stats { blocks_in_use: u32, size_in_use: usize, max_size_in_use: usize, size_allocated: usize }
+    extern "C" {
+        fn malloc_zone_statistics(zone: *mut libc::c_void, stats: *mut Stats);
+    }
+    let mut s = Stats { blocks_in_use: 0, size_in_use: 0, max_size_in_use: 0, size_allocated: 0 };
+    unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut s) };
+    (s.size_in_use >> 20) as u64
+}
+
+pub fn gpu_allocated_mb() -> u64 {
+    #[link(name = "Metal", kind = "framework")]
+    extern "C" {
+        fn MTLCreateSystemDefaultDevice() -> *mut objc2::runtime::AnyObject;
+    }
+    static DEVICE: OnceLock<usize> = OnceLock::new();
+    let dev = *DEVICE.get_or_init(|| unsafe { MTLCreateSystemDefaultDevice() } as usize) as *mut objc2::runtime::AnyObject;
+    if dev.is_null() {
+        return 0;
+    }
+    let bytes: usize = unsafe { objc2::msg_send![&*dev, currentAllocatedSize] };
+    (bytes >> 20) as u64
+}
+
 pub fn set_interactive_qos() {
     set_qos(QOS_CLASS_USER_INTERACTIVE);
 }
@@ -103,6 +159,7 @@ fn raise_open_file_limit() {
 
 fn main() -> Result<()> {
     raise_open_file_limit();
+    heapcheck::start();
     let argv: Vec<String> = std::env::args().collect();
 
     if argv.get(1).map(String::as_str) == Some("--import") {
@@ -137,6 +194,12 @@ fn main() -> Result<()> {
     if argv.get(1).map(String::as_str) == Some("--patch") {
         let (wasm, out) = (argv.get(2).context("--patch <wasm> <out>")?, argv.get(3).context("--patch <wasm> <out>")?);
         std::fs::write(out, patch::patch(&std::fs::read(wasm)?, mp::COMMANDS)?)?;
+        return Ok(());
+    }
+    #[cfg(feature = "jit")]
+    if argv.get(1).map(String::as_str) == Some("--mem32") {
+        let (wasm, out) = (argv.get(2).context("--mem32 <wasm> <out>")?, argv.get(3).context("--mem32 <wasm> <out>")?);
+        std::fs::write(out, mem32::convert(&std::fs::read(wasm)?)?)?;
         return Ok(());
     }
     #[cfg(feature = "jit")]
@@ -329,7 +392,7 @@ fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
 fn compile_patched(engine: &Engine, wasm_path: &std::path::Path) -> Result<Module> {
     let wasm = std::fs::read(wasm_path).with_context(|| format!("{}", wasm_path.display()))?;
     let t = Instant::now();
-    let patched = patch::patch(&wasm, mp::COMMANDS)?;
+    let patched = if patch::is_patched(&wasm) { wasm } else { patch::patch(&wasm, mp::COMMANDS)? };
     eprintln!("[host] multiplayer hooks added in {:?}", t.elapsed());
     Module::new(engine, &patched).map_err(anyhow::Error::from).context("compile module")
 }
@@ -394,6 +457,8 @@ fn engine_config_for(ios: bool) -> Config {
         config.memory_guard_size(2 << 30);
     }
     config.memory_may_move(false);
+    // fill the function table at instantiation so call_indirect skips its lazy-init check
+    config.table_lazy_init(false);
     #[cfg(all(not(feature = "jit"), target_os = "ios", game_code))]
     config.with_custom_code_memory(Some(Arc::new(SignedCode)));
 
@@ -554,6 +619,7 @@ pub fn write_bytes(mem: &SharedMemory, addr: u64, data: &[u8]) -> bool {
     let (base, len) = mem_base_len(mem);
     let a = addr as usize;
     if a + data.len() > len { return false; }
+    heapcheck::note(addr, data.len() as u64, "host write");
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(a), data.len()); }
     true
 }
