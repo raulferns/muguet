@@ -57,6 +57,8 @@ const BUTTONS: &[Spec] = &[
     b(BottomRight(58.0, 168.0), 28.0, Some(("JUMP", Key("Space"))), Some(("H.BRAKE", Key("Space")))),
     b(BottomRight(140.0, 132.0), 26.0, Some(("ENTER", Key("KeyF"))), Some(("EXIT", Key("KeyF")))),
     b(BottomRight(222.0, 98.0), 24.0, Some(("RELOAD", Key("KeyR"))), Some(("HORN", Horn))),
+    b(BottomRight(140.0, 200.0), 26.0, None, Some(("SHOOT", Mouse(1)))),
+    b(BottomRight(222.0, 160.0), 24.0, None, Some(("DUCK", Key("KeyX")))),
     b(TopRight(30.0, 30.0), 22.0, Some(("WEAPON", Key("Tab"))), Some(("WEAPON", Key("Tab")))),
     b(TopRight(84.0, 30.0), 22.0, Some(("COVER", Key("KeyQ"))), Some(("RADIO", Key("KeyQ")))),
     b(TopRight(138.0, 30.0), 22.0, Some(("CROUCH", Key("ControlLeft"))), Some(("LOOK\nBACK", Key("KeyC")))),
@@ -84,11 +86,13 @@ const WHEEL_PUSH: f64 = 40.0;
 static TOUCH_SENS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
 
 const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
+const CLICK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 enum Grip {
     Stick { origin: (f64, f64), at: (f64, f64) },
     Look { last: (f64, f64) },
     Button { idx: usize, start: (f64, f64), last: (f64, f64) },
+    Cursor { since: std::time::Instant, up: bool },
 }
 
 struct Btn {
@@ -106,6 +110,7 @@ struct Overlay {
     stick_home: (f64, f64),
 
     safe: (f64, f64, f64, f64),
+    full: (f64, f64),
     scale: f64,
     grips: HashMap<u64, Grip>,
     held: HashSet<&'static str>,
@@ -118,6 +123,7 @@ struct Overlay {
     aim_latched: bool,
     nav: bool,
     in_car: bool,
+    menu: bool,
     hidden: bool,
 }
 
@@ -266,10 +272,10 @@ pub fn install(window: &Window) {
     let stick_base = circle(&root, stick_home, STICK_RADIUS, 1.0, 0.12);
     let stick_knob = circle(&root, stick_home, KNOB_RADIUS, 1.0, 0.3);
     let mut o = Overlay {
-        root, buttons, stick_base, stick_knob, stick_home, safe, scale,
+        root, buttons, stick_base, stick_knob, stick_home, safe, full: (full.width, full.height), scale,
         grips: HashMap::new(), held: HashSet::new(), since: HashMap::new(),
         mouse_since: [std::time::Instant::now(); 2], lingering: false, mouse: 0, aim_latched: false,
-        nav: false, in_car: false, hidden: false,
+        nav: false, in_car: false, menu: false, hidden: false,
     };
     o.relabel();
     eprintln!("[touch] overlay ready ({:.0}x{:.0} pt, safe area {:.0},{:.0} {:.0}x{:.0})", full.width, full.height, sx, sy, sw, sh);
@@ -323,6 +329,11 @@ impl Overlay {
         p.0 < sx + sw * 0.4 && p.1 > sy + 70.0
     }
 
+    fn cursor_to(&self, p: (f64, f64)) {
+        let (w, h) = input::size();
+        input::mouse_pos((p.0 / self.full.0 * w as f64) as i32, (p.1 / self.full.1 * h as f64) as i32);
+    }
+
     fn touch(&mut self, t: &Touch) {
         let p = (t.location.x / self.scale, t.location.y / self.scale);
         match t.phase {
@@ -335,6 +346,9 @@ impl Overlay {
                         Some(KeyNav(_)) if !self.nav => { self.nav = true; self.relabel(); }
                         _ => {}
                     }
+                } else if self.menu {
+                    self.cursor_to(p);
+                    self.grips.insert(t.id, Grip::Cursor { since: std::time::Instant::now(), up: false });
                 } else if self.in_stick_zone(p) && !self.grips.values().any(|g| matches!(g, Grip::Stick { .. })) {
                     self.grips.insert(t.id, Grip::Stick { origin: p, at: p });
                 } else {
@@ -346,6 +360,7 @@ impl Overlay {
                 match self.grips.get_mut(&t.id) {
                     Some(Grip::Stick { at, .. }) => *at = p,
                     Some(Grip::Button { last, .. }) if wheel => *last = p,
+                    Some(Grip::Cursor { .. }) => self.cursor_to(p),
                     Some(Grip::Look { last }) | Some(Grip::Button { last, .. }) => {
                         let (dx, dy) = (p.0 - last.0, p.1 - last.1);
                         *last = p;
@@ -357,7 +372,10 @@ impl Overlay {
                     None => {}
                 }
             }
-            TouchPhase::Ended | TouchPhase::Cancelled => { self.grips.remove(&t.id); }
+            TouchPhase::Ended | TouchPhase::Cancelled => match self.grips.get_mut(&t.id) {
+                Some(Grip::Cursor { up, .. }) => *up = true,
+                _ => { self.grips.remove(&t.id); }
+            },
         }
         self.apply();
     }
@@ -367,6 +385,8 @@ impl Overlay {
         let mut mouse = if self.aim_latched && !self.in_car { 2u8 } else { 0 };
         let mut stick = None;
         let mut horn = false;
+        let mut clicking = false;
+        self.grips.retain(|_, g| !matches!(g, Grip::Cursor { since, up: true } if since.elapsed() >= CLICK_DELAY + MIN_HOLD));
         for g in self.grips.values() {
             match g {
                 Grip::Stick { origin, at } => stick = Some((*origin, *at)),
@@ -377,6 +397,10 @@ impl Overlay {
                     _ => {}
                 },
                 Grip::Look { .. } => {}
+                Grip::Cursor { since, up } => {
+                    if since.elapsed() >= CLICK_DELAY { mouse |= 1; }
+                    clicking |= *up || since.elapsed() < CLICK_DELAY;
+                }
             }
         }
         if let Some((o, at)) = stick {
@@ -389,8 +413,8 @@ impl Overlay {
             if nx < -0.35 { keys.insert("KeyA"); }
             if nx > 0.35 { keys.insert("KeyD"); }
             if self.in_car {
-                if ny < -0.6 { keys.insert("Numpad8"); }
-                if ny > 0.6 { keys.insert("Numpad2"); }
+                if ny < -0.6 { keys.insert("Numpad8"); keys.insert("ShiftLeft"); }
+                if ny > 0.6 { keys.insert("Numpad2"); keys.insert("ControlLeft"); }
             } else {
                 if ny < -0.35 { keys.insert("KeyW"); }
                 if ny > 0.35 { keys.insert("KeyS"); }
@@ -408,7 +432,7 @@ impl Overlay {
         crate::pad::HORN_TOUCH.store(horn, std::sync::atomic::Ordering::Relaxed);
         let now = std::time::Instant::now();
         let young = |t: Option<&std::time::Instant>| t.is_some_and(|t| now - *t < MIN_HOLD);
-        self.lingering = false;
+        self.lingering = clicking;
         for k in self.held.clone() {
             if keys.contains(k) { continue; }
             if young(self.since.get(k)) { keys.insert(k); self.lingering = true; continue; }
@@ -479,6 +503,12 @@ pub fn refresh() -> bool {
             o.hidden = hide;
             if hide { o.release_all(); }
             set_hidden(&o.root, hide);
+        }
+        let menu = crate::pad::in_menu();
+        if menu != o.menu && !o.hidden {
+            o.grips.retain(|_, g| matches!(g, Grip::Button { .. }));
+            o.menu = menu;
+            o.apply();
         }
         let in_car = crate::pad::IN_VEHICLE.load(std::sync::atomic::Ordering::Relaxed);
         if in_car != o.in_car && !o.hidden {

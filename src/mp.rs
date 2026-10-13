@@ -13,6 +13,7 @@ use wasmtime::{Caller, Val};
 #[cfg_attr(not(feature = "jit"), allow(dead_code))]
 pub const COMMANDS: &[(&str, &str)] = &[
     ("PlayerPedId", "player_commands::CommandPlayerPedId()"),
+    ("IsPauseMenuActive", "hud_commands::CommandIsPauseMenuActive()"),
     ("GetEntityCoords", "entity_commands::CommandGetEntityCoords(int, bool)"),
     ("GetEntityHeading", "entity_commands::CommandGetEntityHeading(int)"),
     ("GetEntityVelocity", "entity_commands::CommandGetEntityVelocity(int)"),
@@ -373,6 +374,30 @@ pub fn time_warp(dir: i64) -> i64 {
 
 static WANT_ENTER: AtomicBool = AtomicBool::new(false);
 static WANT_BULLETS: AtomicBool = AtomicBool::new(false);
+
+static TXD: Mutex<(String, Option<HashMap<String, (Instant, bool)>>)> = Mutex::new((String::new(), None));
+const TXD_PATIENCE: Duration = Duration::from_secs(3);
+
+pub fn txd_loaded(name: u64, answer: i64) -> i64 {
+    let mut t = TXD.lock().unwrap();
+    if answer == 0 {
+        t.0 = read_cstr(&crate::RT.get().unwrap().mem, name);
+        return 0;
+    }
+    let (name, waiting) = &mut *t;
+    let waiting = waiting.get_or_insert_with(HashMap::new);
+    if answer > 1 {
+        waiting.remove(name.as_str());
+        return answer - 1;
+    }
+    let w = waiting.entry(name.clone()).or_insert((Instant::now(), false));
+    if w.0.elapsed() < TXD_PATIENCE { return 0; }
+    if !w.1 {
+        w.1 = true;
+        eprintln!("[host] texture dictionary {name:?} never loads, telling scripts it has");
+    }
+    1
+}
 static TYPED: Mutex<String> = Mutex::new(String::new());
 
 pub fn key_pressed(code: &str) {
@@ -882,6 +907,7 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             let ped = c.i("PlayerPedId", &[]);
             let in_car = ped != 0 && c.exists(ped) && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0;
             crate::pad::IN_VEHICLE.store(in_car, Ordering::Relaxed);
+            crate::pad::script_tick(c.i("IsPauseMenuActive", &[]) != 0);
 
             static HORN_AT: Mutex<Option<Instant>> = Mutex::new(None);
             let mut horn_at = HORN_AT.lock().unwrap();
