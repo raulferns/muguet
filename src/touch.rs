@@ -81,7 +81,6 @@ const fn on(label: &'static str, control: i32) -> Slot {
 
 const VEH_MOVE_LR: i32 = 59;
 const VEH_MOVE_UD: i32 = 60;
-const VEH_ATTACK: i32 = 69;
 const VEH_ACCELERATE: i32 = 71;
 const VEH_BRAKE: i32 = 72;
 const VEH_DUCK: i32 = 73;
@@ -118,7 +117,7 @@ const GAS: Slot = on("GAS", VEH_ACCELERATE);
 const BRAKE: Slot = on("BRAKE", VEH_BRAKE);
 const HBRAKE: Slot = on("H.BRAKE", VEH_HANDBRAKE);
 const HORN: Slot = Some(("HORN", Horn));
-const SHOOT: Slot = on("SHOOT", VEH_ATTACK);
+const SHOOT: Slot = Some(("SHOOT", Mouse(1)));
 const AIR_SHOOT: Slot = on("SHOOT", VEH_FLY_ATTACK);
 const DUCK: Slot = on("DUCK", VEH_DUCK);
 const RADIO: Slot = Some(("RADIO", Key("KeyQ")));
@@ -186,6 +185,7 @@ const WHEEL_PUSH: f64 = 40.0;
 static TOUCH_SENS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
 
 const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
+const ROOF_HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
 const CLICK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 enum Grip {
@@ -708,7 +708,8 @@ impl Overlay {
         self.mouse = mouse;
         for (c, v) in self.injected.clone() {
             if v == 0.0 || inject.iter().any(|(k, _)| *k == c) { continue; }
-            if young(self.ctrl_since.get(&c)) { inject.push((c, v)); self.lingering = true; }
+            let hold = if c == VEH_ROOF { ROOF_HOLD } else { MIN_HOLD };
+            if self.ctrl_since.get(&c).is_some_and(|t| now - *t < hold) { inject.push((c, v)); self.lingering = true; }
         }
         for (c, _) in &inject {
             if !self.injected.iter().any(|(k, _)| k == c) { self.ctrl_since.insert(*c, now); }
