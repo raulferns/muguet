@@ -1,0 +1,103 @@
+name: Compile Muguet IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Generate IPA for iPhone
+    runs-on: macos-26
+    timeout-minutes: 180
+
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Download project code
+        uses: actions/checkout@v4
+
+      - name: Check macOS and Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          XCODE_MAJOR="$(xcodebuild -version | awk '/^Xcode / {split($2,v,"."); print v[1]}')"
+          test "$XCODE_MAJOR" -ge 26
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Prepare Rust for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL \
+              https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh"
+            sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal
+          fi
+
+          source "$HOME/.cargo/env"
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Download and validate game.wasm
+        shell: bash
+        env:
+          GAME_WASM_URL: ${{ secrets.GAME_WASM_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GAME_WASM_URL" ]; then
+            echo "Create the GAME_WASM_URL secret with the direct link to the file."
+            exit 1
+          fi
+
+          mkdir -p ci-input
+
+          curl --fail --location --silent --show-error \
+            --retry 3 --connect-timeout 30 \
+            "$GAME_WASM_URL" -o ci-input/game.wasm
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("ci-input/game.wasm")
+          with path.open("rb") as f:
+              magic = f.read(4)
+
+          if magic != b"\x00asm":
+              raise SystemExit(
+                  "The download is not a valid WASM. Check if the link is direct."
+              )
+
+          print(f"Valid WASM: {path.stat().st_size / 1024 / 1024:.1f} MiB")
+          PY
+
+      - name: Compile and package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./make-ios.sh ci-input/game.wasm --ipa
+          test -s build/Muguet.ipa
+
+      - name: Make IPA available for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-IPA
+          path: build/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 7
